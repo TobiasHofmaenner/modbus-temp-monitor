@@ -43,10 +43,11 @@ from pymodbus.exceptions import ModbusIOException
 
 REG_TEMP = 0x0000
 
-# pymodbus < 3.4 uses 'unit', >= 3.4 uses 'slave'
+# pymodbus renamed the slave-id kwarg across versions:
+#   <3.4 = 'unit', 3.4-3.12 = 'slave', 3.11+ = 'device_id'
 import inspect as _inspect
-_sig = _inspect.signature(AsyncModbusSerialClient.read_holding_registers)
-_SLAVE_KW = "slave" if "slave" in _sig.parameters else "unit"
+_params = set(_inspect.signature(AsyncModbusSerialClient.read_holding_registers).parameters)
+_SLAVE_KW = next(k for k in ("device_id", "slave", "unit") if k in _params)
 PALETTE = [
     QColor(255, 80, 80),
     QColor(80, 200, 120),
