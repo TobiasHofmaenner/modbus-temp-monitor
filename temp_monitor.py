@@ -26,16 +26,17 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QComboBox, QLCDNumber, QFileDialog,
     QGroupBox, QLineEdit, QSpinBox, QMessageBox, QSizePolicy,
-    QScrollArea, QFrame,
+    QScrollArea,
 )
 from PyQt6.QtCore import Qt, QTimer, QPointF
-from PyQt6.QtGui import QColor, QPen, QFont
+from PyQt6.QtGui import QColor, QPen, QFont, QPalette
 from PyQt6.QtCharts import (
     QChart, QChartView, QLineSeries, QValueAxis,
 )
 
 from pymodbus.client import AsyncModbusSerialClient
 from pymodbus.exceptions import ModbusIOException
+import serial.tools.list_ports
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -253,30 +254,45 @@ class Poller:
 # ---------------------------------------------------------------------------
 
 class ModuleCard(QGroupBox):
-    """Small card showing status for one module."""
+    """Small card showing status + color-matched 7-segment temp for one module."""
 
-    def __init__(self, mod: SensorModule, on_remove):
+    def __init__(self, mod: SensorModule, color: QColor, on_remove):
         super().__init__(f"Module {mod.module_id}  —  {mod.port}")
         self.mod = mod
+        self._color = color
         self._on_remove = on_remove
         self._build()
 
     def _build(self):
         lay = QHBoxLayout(self)
+
         self.lbl_status = QLabel("connecting...")
-        self.lbl_temp = QLabel("--- °C")
+        lay.addWidget(self.lbl_status)
+
+        lay.addStretch()
+
+        # 7-segment LCD colored to match the plot line
+        self.lcd_temp = QLCDNumber()
+        self.lcd_temp.setDigitCount(7)
+        self.lcd_temp.display("----")
+        self.lcd_temp.setSegmentStyle(QLCDNumber.SegmentStyle.Flat)
+        self.lcd_temp.setMinimumHeight(45)
+        self.lcd_temp.setMinimumWidth(140)
+        # Color the segments via palette
+        pal = self.lcd_temp.palette()
+        pal.setColor(QPalette.ColorRole.WindowText, self._color)
+        self.lcd_temp.setPalette(pal)
+        lay.addWidget(self.lcd_temp)
+
+        lbl_unit = QLabel("°C")
         font = QFont()
-        font.setPointSize(14)
-        font.setBold(True)
-        self.lbl_temp.setFont(font)
+        font.setPointSize(12)
+        lbl_unit.setFont(font)
+        lay.addWidget(lbl_unit)
 
         btn_rm = QPushButton("Remove")
         btn_rm.setFixedWidth(80)
         btn_rm.clicked.connect(lambda: self._on_remove(self.mod.module_id))
-
-        lay.addWidget(self.lbl_status)
-        lay.addStretch()
-        lay.addWidget(self.lbl_temp)
         lay.addWidget(btn_rm)
 
     def refresh(self):
@@ -288,9 +304,9 @@ class ModuleCard(QGroupBox):
             self.lbl_status.setStyleSheet("color: red;")
 
         if self.mod.last_temp is not None:
-            self.lbl_temp.setText(f"{self.mod.last_temp:.1f} °C")
+            self.lcd_temp.display(f"{self.mod.last_temp:.1f}")
         else:
-            self.lbl_temp.setText("--- °C")
+            self.lcd_temp.display("----")
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +317,7 @@ class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Modbus Temperature Monitor")
-        self.setMinimumSize(1100, 750)
+        self.setMinimumSize(1100, 700)
 
         self._poller = Poller()
         self._next_id = 1
@@ -324,19 +340,26 @@ class MainWindow(QWidget):
         form = QGridLayout(form_group)
 
         form.addWidget(QLabel("Serial port:"), 0, 0)
-        self.inp_port = QLineEdit("/dev/ttyUSB0")
+        self.inp_port = QComboBox()
+        self.inp_port.setEditable(True)
+        self.inp_port.setMinimumWidth(180)
         form.addWidget(self.inp_port, 0, 1)
 
-        form.addWidget(QLabel("Baud:"), 0, 2)
+        self.btn_refresh_ports = QPushButton("Refresh")
+        self.btn_refresh_ports.setFixedWidth(70)
+        self.btn_refresh_ports.clicked.connect(self._refresh_ports)
+        form.addWidget(self.btn_refresh_ports, 0, 2)
+
+        form.addWidget(QLabel("Baud:"), 0, 3)
         self.inp_baud = QSpinBox()
         self.inp_baud.setRange(1200, 115200)
         self.inp_baud.setValue(9600)
-        form.addWidget(self.inp_baud, 0, 3)
+        form.addWidget(self.inp_baud, 0, 4)
 
-        form.addWidget(QLabel("Parity:"), 0, 4)
+        form.addWidget(QLabel("Parity:"), 0, 5)
         self.inp_parity = QComboBox()
         self.inp_parity.addItems(["N", "E", "O"])
-        form.addWidget(self.inp_parity, 0, 5)
+        form.addWidget(self.inp_parity, 0, 6)
 
         form.addWidget(QLabel("Slave ID:"), 1, 0)
         self.inp_slave = QSpinBox()
@@ -344,59 +367,36 @@ class MainWindow(QWidget):
         self.inp_slave.setValue(1)
         form.addWidget(self.inp_slave, 1, 1)
 
-        form.addWidget(QLabel("Poll Hz:"), 1, 2)
+        form.addWidget(QLabel("Poll Hz:"), 1, 3)
         self.inp_poll = QSpinBox()
         self.inp_poll.setRange(1, 50)
         self.inp_poll.setValue(5)
-        form.addWidget(self.inp_poll, 1, 3)
+        form.addWidget(self.inp_poll, 1, 4)
 
-        form.addWidget(QLabel("Scale (°C/LSB):"), 1, 4)
+        form.addWidget(QLabel("Scale (°C/LSB):"), 1, 5)
         self.inp_scale = QLineEdit("0.1")
         self.inp_scale.setFixedWidth(60)
-        form.addWidget(self.inp_scale, 1, 5)
+        form.addWidget(self.inp_scale, 1, 6)
 
         self.btn_add = QPushButton("Add Module")
         self.btn_add.clicked.connect(self._on_add_module)
-        form.addWidget(self.btn_add, 0, 6, 2, 1)
+        form.addWidget(self.btn_add, 0, 7, 2, 1)
 
         root.addWidget(form_group)
+
+        # populate ports on startup
+        self._refresh_ports()
 
         # ---- Module cards (scrollable) ----
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setMaximumHeight(160)
+        scroll.setMaximumHeight(180)
         self._cards_container = QWidget()
         self._cards_layout = QVBoxLayout(self._cards_container)
         self._cards_layout.setContentsMargins(0, 0, 0, 0)
         self._cards_layout.addStretch()
         scroll.setWidget(self._cards_container)
         root.addWidget(scroll)
-
-        # ---- Primary sensor + LCDs ----
-        lcd_row = QHBoxLayout()
-
-        lcd_row.addWidget(QLabel("Primary:"))
-        self.combo_primary = QComboBox()
-        self.combo_primary.setMinimumWidth(120)
-        lcd_row.addWidget(self.combo_primary)
-
-        self.lcd_temp = QLCDNumber()
-        self.lcd_temp.setDigitCount(7)
-        self.lcd_temp.display("----")
-        self.lcd_temp.setSegmentStyle(QLCDNumber.SegmentStyle.Flat)
-        self.lcd_temp.setMinimumHeight(50)
-        lcd_row.addWidget(self.lcd_temp, 2)
-        lcd_row.addWidget(QLabel("°C"))
-
-        self.lcd_grad = QLCDNumber()
-        self.lcd_grad.setDigitCount(7)
-        self.lcd_grad.display("----")
-        self.lcd_grad.setSegmentStyle(QLCDNumber.SegmentStyle.Flat)
-        self.lcd_grad.setMinimumHeight(50)
-        lcd_row.addWidget(self.lcd_grad, 2)
-        lcd_row.addWidget(QLabel("Δ5min °C"))
-
-        root.addLayout(lcd_row)
 
         # ---- Logging controls ----
         log_row = QHBoxLayout()
@@ -439,10 +439,30 @@ class MainWindow(QWidget):
 
         root.addWidget(chart_view, 1)
 
+    # ------------------------------------------------------------ ports
+
+    def _refresh_ports(self):
+        current = self.inp_port.currentText()
+        self.inp_port.clear()
+        ports = sorted(serial.tools.list_ports.comports(), key=lambda p: p.device)
+        for p in ports:
+            label = f"{p.device}" if not p.description or p.description == "n/a" else f"{p.device}  ({p.description})"
+            self.inp_port.addItem(label, p.device)
+        # restore previous selection if still available, otherwise keep first
+        if current:
+            idx = self.inp_port.findData(current)
+            if idx >= 0:
+                self.inp_port.setCurrentIndex(idx)
+            else:
+                self.inp_port.setEditText(current)
+
     # ------------------------------------------------------------ actions
 
     def _on_add_module(self):
-        port = self.inp_port.text().strip()
+        # prefer itemData (pure device path) over display text
+        port = self.inp_port.currentData()
+        if not port:
+            port = self.inp_port.currentText().split("(")[0].strip()
         if not port:
             QMessageBox.warning(self, "Error", "Serial port is required.")
             return
@@ -474,9 +494,9 @@ class MainWindow(QWidget):
         self._poller.add_module(mod)
 
         # series
+        color = PALETTE[(mid - 1) % len(PALETTE)]
         series = QLineSeries()
         series.setName(f"Module {mid} ({port})")
-        color = PALETTE[(mid - 1) % len(PALETTE)]
         pen = QPen(color, 2)
         series.setPen(pen)
         self._chart.addSeries(series)
@@ -484,16 +504,10 @@ class MainWindow(QWidget):
         series.attachAxis(self._axis_y)
         self._series[mid] = series
 
-        # card
-        card = ModuleCard(mod, self._on_remove_module)
+        # card with matching color
+        card = ModuleCard(mod, color, self._on_remove_module)
         self._cards[mid] = card
-        # insert before the stretch
         self._cards_layout.insertWidget(self._cards_layout.count() - 1, card)
-
-        # primary combo
-        self.combo_primary.addItem(f"Module {mid}", mid)
-        if self.combo_primary.count() == 1:
-            self.combo_primary.setCurrentIndex(0)
 
     def _on_remove_module(self, module_id: int):
         self._poller.remove_module(module_id)
@@ -506,12 +520,6 @@ class MainWindow(QWidget):
         series = self._series.pop(module_id, None)
         if series:
             self._chart.removeSeries(series)
-
-        # remove from combo
-        for i in range(self.combo_primary.count()):
-            if self.combo_primary.itemData(i) == module_id:
-                self.combo_primary.removeItem(i)
-                break
 
     def _on_select_log(self):
         default = datetime.now().strftime("temperature_%Y%m%d_%H%M%S.csv")
@@ -545,8 +553,8 @@ class MainWindow(QWidget):
             mod.last_temp = None
         for s in self._series.values():
             s.clear()
-        self.lcd_temp.display("----")
-        self.lcd_grad.display("----")
+        for card in self._cards.values():
+            card.lcd_temp.display("----")
         self._axis_x.setRange(0, 60)
 
     # ------------------------------------------------------------ refresh
@@ -559,12 +567,10 @@ class MainWindow(QWidget):
         x_max = 0.0
 
         for mid, mod in modules.items():
-            # card
             card = self._cards.get(mid)
             if card:
                 card.refresh()
 
-            # series
             series = self._series.get(mid)
             if series is None or not mod.history:
                 continue
@@ -589,38 +595,6 @@ class MainWindow(QWidget):
         if y_min < float("inf"):
             margin = max((y_max - y_min) * 0.1, 1.0)
             self._axis_y.setRange(y_min - margin, y_max + margin)
-
-        # primary LCD
-        primary_mid = self.combo_primary.currentData()
-        if primary_mid is not None and primary_mid in modules:
-            mod = modules[primary_mid]
-            if mod.last_temp is not None:
-                self.lcd_temp.display(f"{mod.last_temp:.1f}")
-            else:
-                self.lcd_temp.display("----")
-
-            # 5-min gradient
-            hist = mod.history
-            if len(hist) >= 2:
-                last_t, last_v = hist[-1]
-                target = last_t - 300.0
-                if hist[0][0] <= target:
-                    val_5m = None
-                    for t, v in hist:
-                        if t >= target:
-                            val_5m = v
-                            break
-                    if val_5m is not None:
-                        self.lcd_grad.display(f"{last_v - val_5m:+.1f}")
-                    else:
-                        self.lcd_grad.display("----")
-                else:
-                    self.lcd_grad.display("----")
-            else:
-                self.lcd_grad.display("----")
-        else:
-            self.lcd_temp.display("----")
-            self.lcd_grad.display("----")
 
     # ------------------------------------------------------------ cleanup
 
