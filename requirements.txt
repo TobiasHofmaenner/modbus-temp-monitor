@@ -1,0 +1,4 @@
+pymodbus>=3.5.4
+pyserial>=3.5
+PyQt6>=6.5
+PyQt6-Charts>=6.5
