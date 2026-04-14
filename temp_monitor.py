@@ -452,13 +452,9 @@ class MainWindow(QWidget):
                 continue
             label = f"{p.device}" if not p.description or p.description == "n/a" else f"{p.device}  ({p.description})"
             self.inp_port.addItem(label, p.device)
-        # restore previous selection if still available, otherwise keep first
-        if current:
-            idx = self.inp_port.findData(current)
-            if idx >= 0:
-                self.inp_port.setCurrentIndex(idx)
-            else:
-                self.inp_port.setEditText(current)
+        # select first available port
+        if self.inp_port.count() > 0:
+            self.inp_port.setCurrentIndex(0)
 
     # ------------------------------------------------------------ cards sizing
 
