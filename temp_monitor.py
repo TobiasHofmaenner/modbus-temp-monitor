@@ -387,16 +387,17 @@ class MainWindow(QWidget):
         # populate ports on startup
         self._refresh_ports()
 
-        # ---- Module cards (scrollable) ----
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setMaximumHeight(180)
+        # ---- Module cards (scrollable after 4) ----
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
         self._cards_container = QWidget()
         self._cards_layout = QVBoxLayout(self._cards_container)
         self._cards_layout.setContentsMargins(0, 0, 0, 0)
         self._cards_layout.addStretch()
-        scroll.setWidget(self._cards_container)
-        root.addWidget(scroll)
+        self._scroll.setWidget(self._cards_container)
+        self._scroll.setVisible(False)
+        self._max_cards_before_scroll = 4
+        root.addWidget(self._scroll)
 
         # ---- Logging controls ----
         log_row = QHBoxLayout()
@@ -456,6 +457,19 @@ class MainWindow(QWidget):
             else:
                 self.inp_port.setEditText(current)
 
+    # ------------------------------------------------------------ cards sizing
+
+    def _update_cards_scroll(self):
+        n = len(self._cards)
+        self._scroll.setVisible(n > 0)
+        if n <= self._max_cards_before_scroll:
+            # no max height — cards grow freely and push the chart down
+            self._scroll.setMaximumHeight(16777215)  # QWIDGETSIZE_MAX
+        else:
+            # lock height to ~4 cards worth, scroll the rest
+            card_h = 65  # approximate height per card
+            self._scroll.setMaximumHeight(card_h * self._max_cards_before_scroll + 10)
+
     # ------------------------------------------------------------ actions
 
     def _on_add_module(self):
@@ -508,6 +522,7 @@ class MainWindow(QWidget):
         card = ModuleCard(mod, color, self._on_remove_module)
         self._cards[mid] = card
         self._cards_layout.insertWidget(self._cards_layout.count() - 1, card)
+        self._update_cards_scroll()
 
     def _on_remove_module(self, module_id: int):
         self._poller.remove_module(module_id)
@@ -520,6 +535,8 @@ class MainWindow(QWidget):
         series = self._series.pop(module_id, None)
         if series:
             self._chart.removeSeries(series)
+
+        self._update_cards_scroll()
 
     def _on_select_log(self):
         default = datetime.now().strftime("temperature_%Y%m%d_%H%M%S.csv")
