@@ -95,17 +95,28 @@ class SensorModule:
         self.log_path: Optional[str] = None
 
     async def connect(self):
-        self.client = AsyncModbusSerialClient(
-            method="rtu",
-            port=self.port,
-            baudrate=self.baudrate,
-            parity=self.parity,
-            stopbits=self.stopbits,
-            timeout=0.6,
-        )
-        ok = await self.client.connect()
-        self.connected = bool(ok)
-        return self.connected
+        print(f"[Module {self.module_id}] Connecting to {self.port} "
+              f"(baud={self.baudrate}, parity={self.parity}, stop={self.stopbits}, slave={self.slave_id})...")
+        try:
+            self.client = AsyncModbusSerialClient(
+                method="rtu",
+                port=self.port,
+                baudrate=self.baudrate,
+                parity=self.parity,
+                stopbits=self.stopbits,
+                timeout=0.6,
+            )
+            ok = await self.client.connect()
+            self.connected = bool(ok)
+            if self.connected:
+                print(f"[Module {self.module_id}] Connected successfully.")
+            else:
+                print(f"[Module {self.module_id}] connect() returned False — check port/permissions.")
+            return self.connected
+        except Exception as e:
+            print(f"[Module {self.module_id}] Connect exception: {e}")
+            self.connected = False
+            return False
 
     async def disconnect(self):
         if self.client:
@@ -124,6 +135,7 @@ class SensorModule:
                 address=REG_TEMP, count=1, slave=self.slave_id,
             )
             if rr.isError():
+                print(f"[Module {self.module_id}] Modbus error response: {rr}")
                 return None
             raw_u16 = rr.registers[0] & 0xFFFF
             raw = raw_u16 - 0x10000 if raw_u16 & 0x8000 else raw_u16
@@ -134,7 +146,8 @@ class SensorModule:
             self.history.append((now, temp_c))
             self._log_row(now, temp_c)
             return temp_c
-        except (ModbusIOException, Exception):
+        except Exception as e:
+            print(f"[Module {self.module_id}] Poll exception: {e}")
             return None
 
     # -- logging helpers --
@@ -188,9 +201,13 @@ class Poller:
             self._modules[mod.module_id] = mod
 
         async def _start():
-            await mod.connect()
-            task = self._loop.create_task(self._poll_loop(mod))
-            self._poll_tasks[mod.module_id] = task
+            ok = await mod.connect()
+            if ok:
+                task = self._loop.create_task(self._poll_loop(mod))
+                self._poll_tasks[mod.module_id] = task
+                print(f"[Poller] Module {mod.module_id} polling started at {mod.poll_hz} Hz.")
+            else:
+                print(f"[Poller] Module {mod.module_id} not connected — polling not started.")
 
         asyncio.run_coroutine_threadsafe(_start(), self._loop)
 
