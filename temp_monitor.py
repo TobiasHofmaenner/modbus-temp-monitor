@@ -444,9 +444,12 @@ class MainWindow(QWidget):
 
     def _refresh_ports(self):
         current = self.inp_port.currentText()
+        used = {card.mod.port for card in self._cards.values()}
         self.inp_port.clear()
         ports = sorted(serial.tools.list_ports.comports(), key=lambda p: p.device)
         for p in ports:
+            if p.device in used:
+                continue
             label = f"{p.device}" if not p.description or p.description == "n/a" else f"{p.device}  ({p.description})"
             self.inp_port.addItem(label, p.device)
         # restore previous selection if still available, otherwise keep first
@@ -523,6 +526,7 @@ class MainWindow(QWidget):
         self._cards[mid] = card
         self._cards_layout.insertWidget(self._cards_layout.count() - 1, card)
         self._update_cards_scroll()
+        self._refresh_ports()
 
     def _on_remove_module(self, module_id: int):
         self._poller.remove_module(module_id)
@@ -537,6 +541,7 @@ class MainWindow(QWidget):
             self._chart.removeSeries(series)
 
         self._update_cards_scroll()
+        self._refresh_ports()
 
     def _on_select_log(self):
         default = datetime.now().strftime("temperature_%Y%m%d_%H%M%S.csv")
