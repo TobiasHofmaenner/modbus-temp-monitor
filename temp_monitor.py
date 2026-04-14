@@ -42,6 +42,11 @@ from pymodbus.exceptions import ModbusIOException
 # ---------------------------------------------------------------------------
 
 REG_TEMP = 0x0000
+
+# pymodbus < 3.4 uses 'unit', >= 3.4 uses 'slave'
+import inspect as _inspect
+_sig = _inspect.signature(AsyncModbusSerialClient.read_holding_registers)
+_SLAVE_KW = "slave" if "slave" in _sig.parameters else "unit"
 PALETTE = [
     QColor(255, 80, 80),
     QColor(80, 200, 120),
@@ -131,7 +136,7 @@ class SensorModule:
             return None
         try:
             rr = await self.client.read_holding_registers(
-                address=REG_TEMP, count=1, slave=self.slave_id,
+                address=REG_TEMP, count=1, **{_SLAVE_KW: self.slave_id},
             )
             if rr.isError():
                 print(f"[Module {self.module_id}] Modbus error response: {rr}")
