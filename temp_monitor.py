@@ -3,8 +3,9 @@
 Standalone Modbus RTU Temperature Monitor.
 
 - Connects to one or more Modbus RTU sensor modules via serial ports.
+- All modules are sampled simultaneously at each tick.
 - Live-plots all sensor data using Qt6 Charts.
-- Optional CSV logging (per-sensor files).
+- Optional CSV logging (single shared file, one row per sample).
 - No ROS 2 dependency.
 
 Usage:
@@ -78,7 +79,6 @@ class SensorModule:
         slave_id: int = 1,
         scale: float = 0.1,
         offset: float = 0.0,
-        poll_hz: float = 5.0,
     ):
         self.module_id = module_id
         self.port = port
@@ -88,18 +88,12 @@ class SensorModule:
         self.slave_id = slave_id
         self.scale = scale
         self.offset = offset
-        self.poll_hz = poll_hz
 
         self.client: Optional[AsyncModbusSerialClient] = None
         self.connected = False
         self.last_temp: Optional[float] = None
         self.last_raw: Optional[int] = None
         self.history: collections.deque = collections.deque(maxlen=100_000)
-
-        # CSV logging
-        self.log_fh = None
-        self.log_writer = None
-        self.log_path: Optional[str] = None
 
     async def connect(self):
         print(f"[Module {self.module_id}] Connecting to {self.port} "
@@ -134,6 +128,8 @@ class SensorModule:
         self.client = None
 
     async def poll_once(self) -> Optional[float]:
+        """Read one sample. Returns temp_c or None on failure.
+        Does NOT update history — the Poller does that with a shared timestamp."""
         if not self.client or not self.connected:
             return None
         try:
@@ -148,101 +144,171 @@ class SensorModule:
             temp_c = raw * self.scale + self.offset
             self.last_raw = raw
             self.last_temp = temp_c
-            now = time.time()
-            self.history.append((now, temp_c))
-            self._log_row(now, temp_c)
             return temp_c
         except Exception as e:
             print(f"[Module {self.module_id}] Poll exception: {e}")
             return None
 
-    # -- logging helpers --
-    def open_log(self, path: str):
-        self.close_log()
-        self.log_path = path
-        is_new = not os.path.exists(path) or os.path.getsize(path) == 0
-        self.log_fh = open(path, "a", newline="", buffering=1)
-        self.log_writer = csv.writer(self.log_fh)
-        if is_new:
-            self.log_writer.writerow(["unix_time", "iso_time", "module_id", "temp_c"])
-
-    def close_log(self):
-        if self.log_fh:
-            try:
-                self.log_fh.flush()
-                self.log_fh.close()
-            except Exception:
-                pass
-        self.log_fh = None
-        self.log_writer = None
-        self.log_path = None
-
-    def _log_row(self, ts: float, temp_c: float):
-        if self.log_writer is None:
-            return
-        iso = datetime.fromtimestamp(ts).isoformat(timespec="milliseconds")
-        try:
-            self.log_writer.writerow([f"{ts:.6f}", iso, self.module_id, f"{temp_c:.6f}"])
-        except Exception:
-            self.close_log()
-
 
 # ---------------------------------------------------------------------------
-# Async poller running in a background thread
+# Async poller — single synchronized loop for all modules
 # ---------------------------------------------------------------------------
 
 class Poller:
-    """Runs an asyncio event loop in a daemon thread, polls all modules."""
+    """Runs an asyncio event loop in a daemon thread.
+    All modules are sampled concurrently at the same tick."""
 
-    def __init__(self):
+    def __init__(self, poll_hz: float = 5.0):
+        self._poll_hz = poll_hz
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
         self._thread.start()
         self._lock = threading.Lock()
         self._modules: dict[int, SensorModule] = {}
-        self._poll_tasks: dict[int, asyncio.Task] = {}
+        self._poll_task: Optional[asyncio.Task] = None
+
+        # shared CSV log
+        self._log_fh = None
+        self._log_writer = None
+        self._log_path: Optional[str] = None
+        self._log_header_ids: list[int] = []  # module IDs in the current header
+
+    def set_poll_hz(self, hz: float):
+        self._poll_hz = hz
 
     def add_module(self, mod: SensorModule):
-        with self._lock:
-            self._modules[mod.module_id] = mod
+        async def _connect():
+            await mod.connect()
+            with self._lock:
+                self._modules[mod.module_id] = mod
+                self._rewrite_log_header_locked()
+            if not self._poll_task or self._poll_task.done():
+                self._poll_task = self._loop.create_task(self._poll_loop())
+            print(f"[Poller] Module {mod.module_id} added. "
+                  f"Synchronized polling at {self._poll_hz} Hz.")
 
-        async def _start():
-            ok = await mod.connect()
-            if ok:
-                task = self._loop.create_task(self._poll_loop(mod))
-                self._poll_tasks[mod.module_id] = task
-                print(f"[Poller] Module {mod.module_id} polling started at {mod.poll_hz} Hz.")
-            else:
-                print(f"[Poller] Module {mod.module_id} not connected — polling not started.")
-
-        asyncio.run_coroutine_threadsafe(_start(), self._loop)
+        asyncio.run_coroutine_threadsafe(_connect(), self._loop)
 
     def remove_module(self, module_id: int):
         with self._lock:
             mod = self._modules.pop(module_id, None)
+            self._rewrite_log_header_locked()
         if mod is None:
             return
-        task = self._poll_tasks.pop(module_id, None)
-        if task:
-            task.cancel()
 
         async def _stop():
             await mod.disconnect()
-            mod.close_log()
 
         asyncio.run_coroutine_threadsafe(_stop(), self._loop)
 
-    async def _poll_loop(self, mod: SensorModule):
-        interval = 1.0 / max(mod.poll_hz, 0.1)
+    async def _poll_loop(self):
+        interval = 1.0 / max(self._poll_hz, 0.1)
         while True:
-            await mod.poll_once()
+            with self._lock:
+                mods = dict(self._modules)
+            if not mods:
+                await asyncio.sleep(interval)
+                continue
+
+            # Sample all modules concurrently — same timestamp
+            results = await asyncio.gather(
+                *(mod.poll_once() for mod in mods.values()),
+                return_exceptions=True,
+            )
+            now = time.time()
+
+            with self._lock:
+                for mod, result in zip(mods.values(), results):
+                    if isinstance(result, Exception) or result is None:
+                        continue
+                    temp_c = result
+                    mod.history.append((now, temp_c))
+
+                # log one row with all values
+                self._log_row_locked(now, mods, results)
+
             await asyncio.sleep(interval)
+
+    # ---- shared CSV logging ----
+
+    def open_log(self, path: str):
+        with self._lock:
+            self._close_log_locked()
+            self._log_path = path
+            is_new = not os.path.exists(path) or os.path.getsize(path) == 0
+            self._log_fh = open(path, "a", newline="", buffering=1)
+            self._log_writer = csv.writer(self._log_fh)
+            if is_new:
+                self._write_log_header_locked()
+            print(f"[Log] Logging to {path}")
+
+    def close_log(self):
+        with self._lock:
+            self._close_log_locked()
+
+    def _close_log_locked(self):
+        if self._log_fh:
+            try:
+                self._log_fh.flush()
+                self._log_fh.close()
+            except Exception:
+                pass
+        self._log_fh = None
+        self._log_writer = None
+        self._log_path = None
+        self._log_header_ids = []
+
+    def _write_log_header_locked(self):
+        if self._log_writer is None:
+            return
+        ids = sorted(self._modules.keys())
+        self._log_header_ids = ids
+        header = ["unix_time", "iso_time"]
+        for mid in ids:
+            header.append(f"module_{mid}_temp_c")
+        self._log_writer.writerow(header)
+
+    def _rewrite_log_header_locked(self):
+        """When modules change, check if we need to update the header.
+        We close and reopen the file with a new header row."""
+        if self._log_path is None:
+            return
+        current_ids = sorted(self._modules.keys())
+        if current_ids == self._log_header_ids:
+            return
+        # reopen — append a new header block for the updated column set
+        self._write_log_header_locked()
+
+    def _log_row_locked(self, now: float, mods: dict, results: list):
+        if self._log_writer is None:
+            return
+        iso = datetime.fromtimestamp(now).isoformat(timespec="milliseconds")
+        row = [f"{now:.6f}", iso]
+        for mid in self._log_header_ids:
+            mod = mods.get(mid)
+            if mod and mod.last_temp is not None:
+                row.append(f"{mod.last_temp:.6f}")
+            else:
+                row.append("")
+        try:
+            self._log_writer.writerow(row)
+        except Exception as e:
+            print(f"[Log] Write error: {e}")
+            self._close_log_locked()
+
+    def get_log_path(self) -> Optional[str]:
+        with self._lock:
+            return self._log_path
 
     def get_modules(self) -> dict[int, SensorModule]:
         with self._lock:
             return dict(self._modules)
 
     def shutdown(self):
+        if self._poll_task:
+            self._poll_task.cancel()
+        with self._lock:
+            self._close_log_locked()
         for mid in list(self._modules):
             self.remove_module(mid)
         self._loop.call_soon_threadsafe(self._loop.stop)
@@ -278,7 +344,6 @@ class ModuleCard(QGroupBox):
         self.lcd_temp.setSegmentStyle(QLCDNumber.SegmentStyle.Flat)
         self.lcd_temp.setMinimumHeight(45)
         self.lcd_temp.setMinimumWidth(140)
-        # Color the segments via palette
         pal = self.lcd_temp.palette()
         pal.setColor(QPalette.ColorRole.WindowText, self._color)
         self.lcd_temp.setPalette(pal)
@@ -319,12 +384,11 @@ class MainWindow(QWidget):
         self.setWindowTitle("Modbus Temperature Monitor")
         self.setMinimumSize(1100, 700)
 
-        self._poller = Poller()
+        self._poller = Poller(poll_hz=5.0)
         self._next_id = 1
         self._cards: dict[int, ModuleCard] = {}
         self._series: dict[int, QLineSeries] = {}
-        self._log_base: Optional[str] = None
-        self._t0: Optional[float] = None  # global time origin
+        self._t0: Optional[float] = None
 
         self._build_ui()
 
@@ -453,7 +517,6 @@ class MainWindow(QWidget):
                 continue
             label = f"{p.device}" if not p.description or p.description == "n/a" else f"{p.device}  ({p.description})"
             self.inp_port.addItem(label, p.device)
-        # select first available port
         if self.inp_port.count() > 0:
             self.inp_port.setCurrentIndex(0)
 
@@ -463,17 +526,14 @@ class MainWindow(QWidget):
         n = len(self._cards)
         self._scroll.setVisible(n > 0)
         if n <= self._max_cards_before_scroll:
-            # no max height — cards grow freely and push the chart down
-            self._scroll.setMaximumHeight(16777215)  # QWIDGETSIZE_MAX
+            self._scroll.setMaximumHeight(16777215)
         else:
-            # lock height to ~4 cards worth, scroll the rest
-            card_h = 65  # approximate height per card
+            card_h = 65
             self._scroll.setMaximumHeight(card_h * self._max_cards_before_scroll + 10)
 
     # ------------------------------------------------------------ actions
 
     def _on_add_module(self):
-        # prefer itemData (pure device path) over display text
         port = self.inp_port.currentData()
         if not port:
             port = self.inp_port.currentText().split("(")[0].strip()
@@ -496,15 +556,10 @@ class MainWindow(QWidget):
             parity=self.inp_parity.currentText(),
             slave_id=self.inp_slave.value(),
             scale=scale,
-            poll_hz=float(self.inp_poll.value()),
         )
 
-        # If logging is active, open a log for this module immediately
-        if self._log_base:
-            root_path, ext = os.path.splitext(self._log_base)
-            ext = ext or ".csv"
-            mod.open_log(f"{root_path}_module_{mid}{ext}")
-
+        # update poll rate from form
+        self._poller.set_poll_hz(float(self.inp_poll.value()))
         self._poller.add_module(mod)
 
         # series
@@ -518,7 +573,7 @@ class MainWindow(QWidget):
         series.attachAxis(self._axis_y)
         self._series[mid] = series
 
-        # card with matching color
+        # card
         card = ModuleCard(mod, color, self._on_remove_module)
         self._cards[mid] = card
         self._cards_layout.insertWidget(self._cards_layout.count() - 1, card)
@@ -543,7 +598,7 @@ class MainWindow(QWidget):
     def _on_select_log(self):
         default = datetime.now().strftime("temperature_%Y%m%d_%H%M%S.csv")
         path, _ = QFileDialog.getSaveFileName(
-            self, "Select log base file", os.path.expanduser(f"~/{default}"),
+            self, "Select log file", os.path.expanduser(f"~/{default}"),
             "CSV (*.csv);;All (*)",
         )
         if not path:
@@ -551,19 +606,11 @@ class MainWindow(QWidget):
         if not os.path.splitext(path)[1]:
             path += ".csv"
 
-        self._log_base = path
-        root_path, ext = os.path.splitext(path)
-        ext = ext or ".csv"
-
-        for mid, mod in self._poller.get_modules().items():
-            mod.open_log(f"{root_path}_module_{mid}{ext}")
-
+        self._poller.open_log(path)
         self.lbl_log.setText(f"Log: {os.path.basename(path)}")
 
     def _on_disable_log(self):
-        self._log_base = None
-        for mod in self._poller.get_modules().values():
-            mod.close_log()
+        self._poller.close_log()
         self.lbl_log.setText("Log: (disabled)")
 
     def _on_reset(self):
@@ -586,7 +633,7 @@ class MainWindow(QWidget):
         y_max = float("-inf")
         x_max = 0.0
 
-        # establish global t0 from the earliest data point across all modules
+        # establish global t0 from the earliest data point
         if self._t0 is None:
             for mod in modules.values():
                 if mod.history:
@@ -621,6 +668,13 @@ class MainWindow(QWidget):
         if y_min < float("inf"):
             margin = max((y_max - y_min) * 0.1, 1.0)
             self._axis_y.setRange(y_min - margin, y_max + margin)
+
+        # update log label
+        lp = self._poller.get_log_path()
+        if lp:
+            self.lbl_log.setText(f"Log: {os.path.basename(lp)}")
+        else:
+            self.lbl_log.setText("Log: (disabled)")
 
     # ------------------------------------------------------------ cleanup
 
