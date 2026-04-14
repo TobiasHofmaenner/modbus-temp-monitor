@@ -30,7 +30,7 @@ from PyQt6.QtWidgets import (
     QScrollArea,
 )
 from PyQt6.QtCore import Qt, QTimer, QPointF
-from PyQt6.QtGui import QColor, QPen, QFont, QPalette
+from PyQt6.QtGui import QColor, QPen, QFont, QPalette, QIcon
 from PyQt6.QtCharts import (
     QChart, QChartView, QLineSeries, QValueAxis,
 )
@@ -383,6 +383,11 @@ class MainWindow(QWidget):
         super().__init__()
         self.setWindowTitle("Modbus Temperature Monitor")
         self.setMinimumSize(1100, 700)
+
+        # window icon — look for icon.png next to this script
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
 
         self._poller = Poller(poll_hz=5.0)
         self._next_id = 1
