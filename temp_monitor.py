@@ -99,7 +99,6 @@ class SensorModule:
               f"(baud={self.baudrate}, parity={self.parity}, stop={self.stopbits}, slave={self.slave_id})...")
         try:
             self.client = AsyncModbusSerialClient(
-                method="rtu",
                 port=self.port,
                 baudrate=self.baudrate,
                 parity=self.parity,
