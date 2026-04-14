@@ -384,8 +384,9 @@ class MainWindow(QWidget):
         self.setWindowTitle("Modbus Temperature Monitor")
         self.setMinimumSize(1100, 700)
 
-        # window icon — look for icon.png next to this script
-        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")
+        # window icon — handle both normal and PyInstaller bundled paths
+        base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+        icon_path = os.path.join(base, "icon.png")
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
 
