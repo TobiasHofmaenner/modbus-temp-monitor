@@ -324,6 +324,7 @@ class MainWindow(QWidget):
         self._cards: dict[int, ModuleCard] = {}
         self._series: dict[int, QLineSeries] = {}
         self._log_base: Optional[str] = None
+        self._t0: Optional[float] = None  # global time origin
 
         self._build_ui()
 
@@ -573,6 +574,7 @@ class MainWindow(QWidget):
             s.clear()
         for card in self._cards.values():
             card.lcd_temp.display("----")
+        self._t0 = None
         self._axis_x.setRange(0, 60)
 
     # ------------------------------------------------------------ refresh
@@ -584,19 +586,25 @@ class MainWindow(QWidget):
         y_max = float("-inf")
         x_max = 0.0
 
+        # establish global t0 from the earliest data point across all modules
+        if self._t0 is None:
+            for mod in modules.values():
+                if mod.history:
+                    self._t0 = mod.history[0][0]
+                    break
+
         for mid, mod in modules.items():
             card = self._cards.get(mid)
             if card:
                 card.refresh()
 
             series = self._series.get(mid)
-            if series is None or not mod.history:
+            if series is None or not mod.history or self._t0 is None:
                 continue
 
-            t0 = mod.history[0][0]
             points = []
             for t, v in mod.history:
-                x = t - t0
+                x = t - self._t0
                 points.append(QPointF(x, v))
                 if v < y_min:
                     y_min = v
